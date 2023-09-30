@@ -26,7 +26,7 @@
 //! [`regex-automata`]: https://crates.io/crates/regex-automata
 //! [syntax]: https://docs.rs/regex-automata/0.1.7/regex_automata/#syntax
 
-use regex_automata::Anchored;
+use regex_automata::{Anchored, Input};
 // use regex_automata::{dense, DenseDFA, SparseDFA, StateID, DFA};
 use regex_automata::dfa::Automaton;
 use regex_automata::dfa::{dense, sparse, StartKind};
@@ -43,7 +43,7 @@ where
     A: Automaton,
 {
     automaton: A,
-    start: StateID,
+    anchored: bool,
 }
 
 /// A reference to a [`Pattern`] that matches a single input.
@@ -89,10 +89,10 @@ impl Pattern {
     /// ```
     pub fn new(pattern: &str) -> Result<Self, dense::BuildError> {
         let automaton = dense::DFA::new(pattern)?;
-        let start = automaton
-            .universal_start_state(Anchored::No)
-            .expect("I hope this works");
-        Ok(Pattern { automaton, start })
+        Ok(Pattern {
+            automaton,
+            anchored: false,
+        })
     }
 
     /// Returns a new `Pattern` anchored at the beginning of the input stream,
@@ -128,10 +128,10 @@ impl Pattern {
         let automaton = dense::Builder::new()
             .configure(dense::DFA::config().start_kind(StartKind::Anchored))
             .build(pattern)?;
-        let start = automaton
-            .universal_start_state(Anchored::Yes)
-            .expect("I hope this works");
-        Ok(Pattern { automaton, start })
+        Ok(Pattern {
+            automaton,
+            anchored: true,
+        })
     }
 }
 
@@ -147,10 +147,24 @@ where
     A: Automaton,
     Self: for<'a> ToMatcher<'a>,
 {
+    fn get_universal_start_state(&self) -> Option<StateID> {
+        self.automaton.universal_start_state(if self.anchored {
+            Anchored::Yes
+        } else {
+            Anchored::No
+        })
+    }
+
     /// Returns `true` if this pattern matches the given string.
     #[inline]
     pub fn matches(&self, s: &impl AsRef<str>) -> bool {
-        self.matcher().matches(s)
+        let Some(start) = self
+            .get_universal_start_state()
+            .or_else(|| get_display_start_state(&self, &s.as_ref()))
+        else {
+            return false;
+        };
+        self.matcher(start).matches(s)
     }
 
     /// Returns `true` if this pattern matches the formatted output of the given
@@ -178,7 +192,13 @@ where
     /// ```
     #[inline]
     pub fn debug_matches(&self, d: &impl fmt::Debug) -> bool {
-        self.matcher().debug_matches(d)
+        let Some(start) = self
+            .get_universal_start_state()
+            .or_else(|| get_debug_start_state(&self, d))
+        else {
+            return false;
+        };
+        self.matcher(start).debug_matches(d)
     }
 
     /// Returns `true` if this pattern matches the formatted output of the given
@@ -214,15 +234,47 @@ where
     /// ```
     #[inline]
     pub fn display_matches(&self, d: &impl fmt::Display) -> bool {
-        self.matcher().display_matches(d)
+        let Some(start) = self
+            .get_universal_start_state()
+            .or_else(|| get_display_start_state(&self, d))
+        else {
+            return false;
+        };
+        self.matcher(start).display_matches(d)
     }
 
     /// Returns either a `bool` indicating whether or not this pattern matches the
     /// data read from the provided `io::Read` stream, or an `io::Error` if an
     /// error occurred reading from the stream.
     #[inline]
-    pub fn read_matches(&self, io: impl io::Read) -> io::Result<bool> {
-        self.matcher().read_matches(io)
+    pub fn read_matches(&self, mut io: impl io::Read) -> io::Result<bool> {
+        use std::io::Read;
+        let bytes;
+        let mut input = [0; 1];
+        let start = match self.get_universal_start_state() {
+            Some(start) => {
+                bytes = [].chain(io);
+                start
+            }
+            None => {
+                let anchored = if self.anchored {
+                    Anchored::Yes
+                } else {
+                    Anchored::No
+                };
+                io.read_exact(&mut input)?;
+                let Some(start) = self
+                    .automaton
+                    .start_state_forward(&Input::new(&input).anchored(anchored))
+                    .ok()
+                else {
+                    return Ok(false);
+                };
+                bytes = input.chain(io);
+                start
+            }
+        };
+        self.matcher(start).read_matches(bytes)
     }
 }
 
@@ -341,22 +393,22 @@ where
     Self: crate::sealed::Sealed,
 {
     type Automaton: Automaton;
-    fn matcher(&'a self) -> Matcher<'a, Self::Automaton>;
+    fn matcher(&'a self, start: StateID) -> Matcher<'a, Self::Automaton>;
 }
 
 impl crate::sealed::Sealed for Pattern<dense::DFA<Vec<u32>>> {}
 
 impl<'a> ToMatcher<'a> for Pattern<dense::DFA<Vec<u32>>> {
     type Automaton = dense::DFA<&'a [u32]>;
-    fn matcher(&'a self) -> Matcher<'a, Self::Automaton> {
-        Matcher::new(self.automaton.as_ref(), self.start)
+    fn matcher(&'a self, start: StateID) -> Matcher<'a, Self::Automaton> {
+        Matcher::new(self.automaton.as_ref(), start)
     }
 }
 
 impl<'a> ToMatcher<'a> for Pattern<sparse::DFA<Vec<u8>>> {
     type Automaton = sparse::DFA<&'a [u8]>;
-    fn matcher(&'a self) -> Matcher<'a, Self::Automaton> {
-        Matcher::new(self.automaton.as_ref(), self.start)
+    fn matcher(&'a self, start: StateID) -> Matcher<'a, Self::Automaton> {
+        Matcher::new(self.automaton.as_ref(), start)
     }
 }
 
@@ -595,4 +647,49 @@ mod test {
             });
         }
     }
+}
+
+struct InitalRead<'a, A: Automaton>(&'a Pattern<A>, Option<StateID>);
+
+impl<'a, A: Automaton> InitalRead<'a, A> {
+    fn new(automaton: &'a Pattern<A>) -> Self {
+        Self(automaton, None)
+    }
+}
+
+impl<'a, A: Automaton> fmt::Write for InitalRead<'a, A> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let anchored = if self.0.anchored {
+            Anchored::Yes
+        } else {
+            Anchored::No
+        };
+        self.1 = Some(
+            self.0
+                .automaton
+                .start_state_forward(&Input::new(s).anchored(anchored))
+                .unwrap(),
+        );
+        Ok(())
+    }
+}
+
+fn get_debug_start_state<A: Automaton>(
+    automaton: &Pattern<A>,
+    d: &impl fmt::Debug,
+) -> Option<StateID> {
+    use fmt::Write;
+    let mut reader = InitalRead::new(automaton);
+    _ = write!(&mut reader, "{:?}", d);
+    reader.1
+}
+
+fn get_display_start_state<A: Automaton>(
+    automaton: &Pattern<A>,
+    d: &impl fmt::Display,
+) -> Option<StateID> {
+    use fmt::Write;
+    let mut reader = InitalRead::new(automaton);
+    _ = write!(&mut reader, "{}", d);
+    reader.1
 }
